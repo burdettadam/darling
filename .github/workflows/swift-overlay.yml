@@ -13,6 +13,8 @@ jobs:
     if: github.repository == 'burdettadam/darling'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -23,8 +25,27 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: 388b58d4335e373bfe6fbd69060adccb69bd79b2
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Rebase the reviewed fix onto current upstream
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config fetch.recurseSubmodules false
+          git fetch --no-recurse-submodules --no-tags --depth=256 \
+            https://github.com/darlinghq/darling.git \
+            ce0f3340848aa763fe3b7e934e593888a2102cc6
+          git switch -c validated-swiftly
+          git rebase --onto ce0f3340848aa763fe3b7e934e593888a2102cc6 \
+            0c03684eebb9986753436b963f1deeb406baad53
+          # Match the locally reviewed and regression-tested rebased source.
+          test "$(git rev-parse HEAD^{tree})" = f9aaaedec704c5ffe94e4c0838d7c6a559749b14
+          git diff --check ce0f3340848aa763fe3b7e934e593888a2102cc6 HEAD
+          git range-diff \
+            0c03684eebb9986753436b963f1deeb406baad53..388b58d4335e373bfe6fbd69060adccb69bd79b2 \
+            ce0f3340848aa763fe3b7e934e593888a2102cc6..HEAD
 
       - name: Prepare the Linux runner
         run: |
@@ -139,3 +160,19 @@ jobs:
             printf 'CTest regression passed. The production `swiftDarwin` target compiled and linked for x86_64 and arm64.\n\n'
             printf 'This is build validation; the Darwin library was not executed inside Darling.\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the validated branch with a lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git rev-parse HEAD^{tree})" = f9aaaedec704c5ffe94e4c0838d7c6a559749b14
+          gh auth setup-git --hostname github.com
+          # Preserve the previous tip and refuse to overwrite concurrent work.
+          git push --atomic \
+            --force-with-lease=refs/heads/fix/swiftly-toolchain:388b58d4335e373bfe6fbd69060adccb69bd79b2 \
+            origin \
+            388b58d4335e373bfe6fbd69060adccb69bd79b2:refs/heads/backup/swiftly-toolchain-388b58d4 \
+            HEAD:refs/heads/fix/swiftly-toolchain
+          printf '\nPublished tested commit: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
