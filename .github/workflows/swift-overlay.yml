@@ -1,0 +1,131 @@
+name: Swift overlay build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/swift-overlay-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  swift-darwin:
+    if: github.repository == 'burdettadam/darling'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 388b58d4335e373bfe6fbd69060adccb69bd79b2
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare the Linux runner
+        run: |
+          set -euo pipefail
+          # These unused SDKs occupy space on this disposable hosted runner.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            devscripts equivs debhelper git-lfs clang-18 llvm-18 \
+            ca-certificates curl gnupg libcurl4-openssl-dev libedit-dev
+          cd "$RUNNER_TEMP"
+          sudo mk-build-deps --install --remove \
+            --tool 'apt-get --no-install-recommends -y' \
+            "$GITHUB_WORKSPACE/debian/control"
+          /usr/bin/cmake --version
+          /usr/bin/clang-18 --version
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Fetch the pinned upstream submodules
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          original_origin="$(git remote get-url origin)"
+          trap 'git remote set-url origin "$original_origin"' EXIT
+          # The project's relative sibling URLs belong to darlinghq.
+          git remote set-url origin https://github.com/darlinghq/darling.git
+          git submodule update --init --recursive --depth 1 --jobs 8
+          git -C src/external/swift lfs pull
+          git rev-parse HEAD
+          git -C src/external/swift rev-parse HEAD
+          file src/external/swift/libswiftCore.dylib
+          df -h .
+
+      - name: Install Swiftly and Swift
+        run: |
+          set -euo pipefail
+          export SWIFTLY_HOME_DIR="$RUNNER_TEMP/swiftly-home"
+          export SWIFTLY_BIN_DIR="$RUNNER_TEMP/swiftly-bin"
+          mkdir -p "$RUNNER_TEMP/swiftly-bootstrap"
+          cd "$RUNNER_TEMP/swiftly-bootstrap"
+          curl -fsSL "https://download.swift.org/swiftly/linux/swiftly-1.2.0-$(uname -m).tar.gz" \
+            -o swiftly.tar.gz
+          tar xzf swiftly.tar.gz
+          ./swiftly init --assume-yes --skip-install --no-modify-profile
+          . "$SWIFTLY_HOME_DIR/env.sh"
+          swiftly install 6.4.2 --assume-yes \
+            --post-install-file="$RUNNER_TEMP/swift-post-install.sh"
+          if [[ -f "$RUNNER_TEMP/swift-post-install.sh" ]]; then
+            sudo bash "$RUNNER_TEMP/swift-post-install.sh"
+          fi
+          printf '%s\n' 6.4.2 > "$GITHUB_WORKSPACE/.swift-version"
+          printf 'SWIFTLY_HOME_DIR=%s\nSWIFTLY_BIN_DIR=%s\n' \
+            "$SWIFTLY_HOME_DIR" "$SWIFTLY_BIN_DIR" >> "$GITHUB_ENV"
+          printf '%s\n' "$SWIFTLY_BIN_DIR" >> "$GITHUB_PATH"
+          swiftly --version
+
+      - name: Configure Darling through the Swiftly proxy
+        run: |
+          set -euo pipefail
+          unset SWIFT_TOOLCHAIN
+          /usr/bin/cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=/usr/bin/clang-18 \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++-18 \
+            -DCMAKE_BUILD_TYPE=Release -DCOMPONENTS=system \
+            '-DDARLING_ARCHS=x86_64;arm64' \
+            -DDARLING_SWIFT_WMO=ON -DDARLING_SWIFT_JOBS=1 \
+            -DENABLE_METAL=OFF -DCOMPILE_PY2_BYTECODE=OFF \
+            -DDARLING_NO_CCACHE=ON \
+            "-DCMAKE_PROGRAM_PATH=$SWIFTLY_BIN_DIR" -DSWIFT_TOOLCHAIN=
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          cache = Path('build/CMakeCache.txt').read_text().splitlines()
+          expected = 'SWIFT_COMPILER:FILEPATH=' + os.environ['SWIFTLY_BIN_DIR'] + '/swiftc'
+          assert expected in cache, 'The configure did not discover the Swiftly proxy'
+          PY
+          /usr/bin/ctest --test-dir build -R '^swift_toolchain$' --no-tests=error --output-on-failure
+
+      - name: Compile the actual Darwin overlay for both architectures
+        run: |
+          set -euo pipefail
+          /usr/bin/cmake --build build --parallel 2 --verbose --target \
+            src/external/swift/swiftDarwin.x86_64.swift.o \
+            src/external/swift/swiftDarwin.arm64.swift.o
+          test -s build/swift-overlay-modules/x86_64/Darwin.swiftmodule
+          test -s build/swift-overlay-modules/arm64/Darwin.swiftmodule
+
+      - name: Build and verify the swiftDarwin library target
+        run: |
+          set -euo pipefail
+          /usr/bin/cmake --build build --parallel 2 --target swiftDarwin
+          dylib=build/src/external/swift/libswiftDarwin.dylib
+          test -s "$dylib"
+          file "$dylib"
+          build/src/external/cctools-port/cctools/misc/lipo -info "$dylib"
+          build/src/external/cctools-port/cctools/misc/lipo "$dylib" -verify_arch x86_64 arm64
+          sha256sum "$dylib"
+          {
+            printf '## Swift Darwin overlay validation\n\n'
+            printf 'Commit: `%s`\n\n' "$(git rev-parse HEAD)"
+            printf 'Swiftly 1.2.0; Swift 6.4.2; Ubuntu 24.04; Clang 18.\n\n'
+            printf 'CTest regression passed. The production `swiftDarwin` target compiled and linked for x86_64 and arm64.\n\n'
+            printf 'This is build validation; the Darwin library was not executed inside Darling.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
