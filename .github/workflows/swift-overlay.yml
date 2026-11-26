@@ -31,6 +31,16 @@ jobs:
           set -euo pipefail
           # These unused SDKs occupy space on this disposable hosted runner.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+          # Avoid the runner's EC2 mirror after repeated package-download stalls.
+          printf '%s\tpriority:%s\n' \
+            'https://archive.ubuntu.com/ubuntu/' 1 \
+            'https://security.ubuntu.com/ubuntu/' 2 \
+            | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          printf '%s\n' \
+            'Acquire::Retries "1";' \
+            'Acquire::http::Timeout "15";' \
+            'Acquire::https::Timeout "15";' \
+            | sudo tee /etc/apt/apt.conf.d/zzzz-darling-ci-acquire >/dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             devscripts equivs debhelper git-lfs clang-18 llvm-18 \
