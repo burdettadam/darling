@@ -1,0 +1,114 @@
+name: Swiftly toolchain discovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/swiftly-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  discovery:
+    if: github.repository == 'burdettadam/darling'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            cmake/swift_toolchain.cmake
+            tests/swift-toolchain.py
+
+      - name: Run host discovery regression tests
+        run: |
+          cmake --version
+          python3 tests/swift-toolchain.py -v
+
+      - name: Reproduce and fix discovery with real Swiftly
+        run: |
+          set -euo pipefail
+          export SWIFTLY_HOME_DIR="$RUNNER_TEMP/swiftly-home"
+          export SWIFTLY_BIN_DIR="$RUNNER_TEMP/swiftly-bin"
+          unset SWIFT_TOOLCHAIN
+          git fetch --no-tags --depth=1 origin 0c03684eebb9986753436b963f1deeb406baad53
+          git show 0c03684eebb9986753436b963f1deeb406baad53:cmake/swift_toolchain.cmake \
+            > "$RUNNER_TEMP/swiftly-baseline.cmake"
+          mkdir -p "$RUNNER_TEMP/swiftly-bootstrap" "$RUNNER_TEMP/swiftly-probe"
+          cd "$RUNNER_TEMP/swiftly-bootstrap"
+
+          # Official installer URLs and automation flags:
+          # https://github.com/swiftlang/swiftly/blob/1.2.0/Sources/Swiftly/SelfUpdate.swift
+          # https://www.swift.org/swiftly/documentation/swiftly/automated-install/
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y ca-certificates curl gnupg
+            curl -fsSL "https://download.swift.org/swiftly/linux/swiftly-1.2.0-$(uname -m).tar.gz" \
+              -o swiftly.tar.gz
+            tar xzf swiftly.tar.gz
+            ./swiftly init --assume-yes --skip-install --no-modify-profile
+          else
+            curl -fsSL https://download.swift.org/swiftly/darwin/swiftly-1.2.0.pkg \
+              -o swiftly.pkg
+            installer -pkg swiftly.pkg -target CurrentUserHomeDirectory
+            "$HOME/.swiftly/bin/swiftly" init --assume-yes --skip-install --no-modify-profile
+          fi
+          . "$SWIFTLY_HOME_DIR/env.sh"
+          hash -r
+          swiftly --version
+          swiftly install 6.4.2 --assume-yes \
+            --post-install-file="$RUNNER_TEMP/swift-post-install.sh"
+          if [[ -f "$RUNNER_TEMP/swift-post-install.sh" ]]; then
+            sudo bash "$RUNNER_TEMP/swift-post-install.sh"
+          fi
+
+          # Keep selection deterministic without adding a file to the checkout.
+          cd "$RUNNER_TEMP/swiftly-probe"
+          printf '%s\n' 6.4.2 > .swift-version
+          export SELECTED_TOOLCHAIN
+          SELECTED_TOOLCHAIN="$(swiftly use --print-location)"
+          test -n "$SELECTED_TOOLCHAIN"
+          "$SELECTED_TOOLCHAIN/usr/bin/swiftc" --version
+
+          cat > probe.cmake <<'CMAKE'
+          include("${DETECTION_MODULE}")
+          get_property(discovered CACHE SWIFT_COMPILER PROPERTY VALUE)
+          if (NOT "${discovered}" STREQUAL "$ENV{SWIFTLY_BIN_DIR}/swiftc")
+            message(FATAL_ERROR "Discovery did not use the Swiftly proxy: ${discovered}")
+          endif()
+          if (NOT "${SWIFT_TOOLCHAIN_FOUND}" STREQUAL "${EXPECT_FOUND}")
+            message(FATAL_ERROR "Expected FOUND=${EXPECT_FOUND}, got ${SWIFT_TOOLCHAIN_FOUND}")
+          endif()
+          if (EXPECT_FOUND)
+            get_filename_component(expected_usr "$ENV{SELECTED_TOOLCHAIN}/usr" REALPATH)
+            if (NOT "${SWIFT_COMPILER}" STREQUAL "$ENV{SELECTED_TOOLCHAIN}/usr/bin/swiftc")
+              message(FATAL_ERROR "Wrong selected compiler: ${SWIFT_COMPILER}")
+            endif()
+            if (NOT "${SWIFT_TOOLCHAIN_USR}" STREQUAL "${expected_usr}")
+              message(FATAL_ERROR "Wrong toolchain resources: ${SWIFT_TOOLCHAIN_USR}")
+            endif()
+            if (NOT "${SWIFT_TOOLCHAIN_VERSION}" STREQUAL "6.4.2")
+              message(FATAL_ERROR "Wrong compiler version: ${SWIFT_TOOLCHAIN_VERSION}")
+            endif()
+          endif()
+          message(STATUS "Swiftly discovery assertion passed: FOUND=${SWIFT_TOOLCHAIN_FOUND}")
+          CMAKE
+
+          # Each script invocation starts with a fresh CMake cache. The original
+          # module must skip overlays, and the patched module must find them.
+          cmake "-DCMAKE_PROGRAM_PATH=$SWIFTLY_BIN_DIR" -DSWIFT_TOOLCHAIN= \
+            "-DDETECTION_MODULE=$RUNNER_TEMP/swiftly-baseline.cmake" \
+            -DEXPECT_FOUND=FALSE -P probe.cmake
+          cmake "-DCMAKE_PROGRAM_PATH=$SWIFTLY_BIN_DIR" -DSWIFT_TOOLCHAIN= \
+            "-DDETECTION_MODULE=$GITHUB_WORKSPACE/cmake/swift_toolchain.cmake" \
+            -DEXPECT_FOUND=TRUE -P probe.cmake
