@@ -1,166 +1,383 @@
-name: Darling CI
+# CI branch only: replace .github/workflows/actions.yaml on
+# ci/1388-sudo-qualification. Keep this workflow out of the upstream fix.
+name: Sudo 1388 qualification
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ci/1388-sudo-qualification]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character production commit to qualify
+        required: true
+        type: string
 
-# Supersede in-flight runs for the same branch/PR, but never cancel a build of
-# the default branch -- those runs publish the daily packages.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha || '55d7af5f9597c647226ccf3f4ffa1631a694c049' }}
+  BASE_SHA: c97ed9e7d4aaacb307acfd109c9b6cad77dc0016
+  REVIEWED_SHA: ef4769e5a168aec4a07bdd68bfa070b2430d302a
+  GIT_LFS_SKIP_SMUDGE: '1'
+  QUALIFICATION_HELPER: |
+    #!/usr/bin/env python3
+    """Helpers for the isolated sudo qualification workflow, not product code."""
+
+    import email.parser
+    import os
+    from pathlib import Path
+    import re
+    import signal
+    import subprocess
+    import sys
+
+
+    def select_debs(directory):
+        """Select CLI runtime packages and their local Darling dependencies."""
+        packages = {}
+        for path in sorted(Path(directory).rglob("*.deb")):
+            control = subprocess.check_output(["dpkg-deb", "--field", str(path)], text=True)
+            fields = email.parser.Parser().parsestr(control)
+            if fields["Architecture"] not in ("all", "amd64"):
+                continue
+            name = fields["Package"]
+            if name in packages:
+                raise SystemExit(f"Multiple candidate packages for {name}")
+            packages[name] = (path, fields)
+        selected = set()
+        pending = ["darling-core-native", "darling-core", "darling-system", "darling-cli"]
+        while pending:
+            name = pending.pop()
+            if name in selected:
+                continue
+            if name not in packages:
+                raise SystemExit(f"Pinned artifact is missing required package {name}")
+            selected.add(name)
+            _, fields = packages[name]
+            dependencies = fields.get("Depends", "") + "," + fields.get("Pre-Depends", "")
+            for group in dependencies.split(","):
+                # The local packages have simple dependencies. Include any Darling
+                # alternative from this same artifact; apt checks version constraints.
+                for alternative in group.split("|"):
+                    match = re.match(r"\s*([a-z0-9][a-z0-9+.-]*)", alternative)
+                    if match and match[1].startswith("darling"):
+                        pending.append(match[1])
+        for name in sorted(selected):
+            path, fields = packages[name]
+            print(f"Runtime: {name} {fields['Version']} {fields['Architecture']}", file=sys.stderr)
+            sys.stdout.buffer.write(os.fsencode(path.resolve()) + b"\0")
+
+
+    def run_with_timeout(log, seconds, command):
+        """Bound a native macOS subprocess and its own children, with no timeout dependency."""
+        with open(log, "wb") as output:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                return process.wait(timeout=int(seconds))
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                return 124
+
+
+    def report_suite(label, logfile, status):
+        text = Path(logfile).read_text(errors="replace")
+        lines = text.splitlines()
+        passes = [line for line in lines if line.startswith("PASS: ")]
+        failures = [line for line in lines if line.startswith("FAIL: ")]
+        summaries = re.findall(r"(?m)^(\d+) checks, (\d+) failures$", text)
+        status = int(status)
+        if not summaries:
+            raise SystemExit(f"{label}: suite did not complete; status={status}")
+        checks, failed = map(int, summaries[-1])
+        if checks != len(passes) + len(failures) or failed != len(failures) or checks == 0:
+            raise SystemExit(f"{label}: inconsistent test accounting")
+        if "PASS: ordinary command" not in passes:
+            raise SystemExit(f"{label}: basic execution failed; not a valid before/after comparison")
+        if label == "baseline":
+            required = ("FAIL: single assignment (", "FAIL: HOME assignment from issue 1388 (")
+            good = status == 1 and all(any(line.startswith(prefix) for line in failures)
+                                       for prefix in required)
+        elif label == "reviewed":
+            good = (status == 1 and "PASS: single assignment" in passes and
+                    any(line.startswith("FAIL: original PATH selects command, assigned PATH reaches child (")
+                        for line in failures))
+        elif label == "final":
+            good = status == 0 and failed == 0
+        else:
+            raise SystemExit(f"Unknown comparison label: {label}")
+        summary = f"### {label}: {checks - failed}/{checks} passed; exit {status}\n\n"
+        summary += "\n".join(f"- {line}" for line in failures) + "\n\n"
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                output.write(summary)
+        print(summary, end="")
+        if not good:
+            raise SystemExit(f"{label}: expected differential evidence was not obtained")
+
+
+    if __name__ == "__main__":
+        mode, *args = sys.argv[1:]
+        if mode == "select-debs":
+            select_debs(*args)
+        elif mode == "run":
+            raise SystemExit(run_with_timeout(args[0], args[1], args[2:]))
+        elif mode == "report":
+            report_suite(*args)
+        else:
+            raise SystemExit(f"Unknown mode: {mode}")
 
 jobs:
-  # Builds of branches in this repository wait for a maintainer's approval in
-  # the ci-approval environment. Pushes to the default branch run without it,
-  # and pull requests from forks are left to the repository's fork approval
-  # setting, so they aren't approved twice.
-  approval:
-    if: >-
-      !(github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) &&
-      !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ubuntu-latest
-    environment: ci-approval
+  guest:
+    if: github.repository == 'burdettadam/darling'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
-    - run: echo "Approved"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Qualify real Mach-O programs inside Darling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          harness="$RUNNER_TEMP/sudo-1388-harness"
+          mkdir -p "$harness"
+          printf '%s\n' "$QUALIFICATION_HELPER" >"$harness/qualification.py"
+          cat >"$harness/run-linux.sh" <<'__DARLING_QUALIFICATION_SCRIPT__'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ulimit -c 0
 
-  build-deb:
-    needs: approval
-    if: ${{ !cancelled() && (needs.approval.result == 'success' || needs.approval.result == 'skipped') }}
-    # The Architecture: all packages (the Mach-O part, with i386, x86_64 and
-    # arm64 slices) and the amd64 darling-core-native.
-    name: Build DEBs
-    runs-on: ubuntu-latest
+          source_dir=$(cd "$1" && pwd)
+          harness=$(cd "$(dirname "$0")" && pwd)
+          [[ ${SOURCE_SHA:?} =~ ^[0-9a-f]{40}$ ]]
+          [[ $(git -C "$source_dir" rev-parse HEAD) == "$SOURCE_SHA" ]]
+          work=$(mktemp -d "$RUNNER_TEMP/sudo-1388-guest.XXXXXX")
+          export DPREFIX="$work/prefix"
+          mkdir -p "$work/bin" "$work/logs" "$work/tmp" "$work/debs" "$work/linker"
+
+          cleanup() {
+              if command -v darling >/dev/null 2>&1; then
+                  timeout -s KILL 30 darling shutdown </dev/null >"$work/logs/shutdown.log" 2>&1 || true
+                  cat "$work/logs/shutdown.log"
+              fi
+              # The hosted VM discards this private prefix and the retained fixtures.
+              # Never remove a prefix after an unsuccessful shutdown or run guest rm.
+          }
+          trap cleanup EXIT
+
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libssl-dev git-lfs unzip file
+
+          # Fetch only the recorded historical source revisions, never a moving branch.
+          git -C "$source_dir" fetch --no-tags --depth=1 origin "$BASE_SHA" "$REVIEWED_SHA"
+          git -C "$source_dir" show "$BASE_SHA:src/tools/sudo.c" >"$work/baseline.c"
+          git -C "$source_dir" show "$REVIEWED_SHA:src/tools/sudo.c" >"$work/reviewed.c"
+
+          # Sibling submodule repositories belong to darlinghq, not the fork owner.
+          origin=$(git -C "$source_dir" remote get-url origin)
+          git -C "$source_dir" remote set-url origin https://github.com/darlinghq/darling.git
+          git -C "$source_dir" submodule sync --recursive
+          git -C "$source_dir" submodule update --init --recursive --depth=1 --jobs=8
+          git -C "$source_dir" remote set-url origin "$origin"
+
+          # Published upstream runtime, not a source build or a host compatibility shim.
+          # https://github.com/darlinghq/darling/actions/runs/45704448943
+          gh api repos/darlinghq/darling/actions/artifacts/15065757973/zip >"$work/runtime.zip"
+          printf '%s  %s\n' \
+              310f92fe7e942265475680123dc8ab890ccace6acfabd30844ed10a9071c9c35 \
+              "$work/runtime.zip" | sha256sum --check --strict
+          unzip -q "$work/runtime.zip" -d "$work/debs"
+          python3 "$harness/qualification.py" select-debs "$work/debs" >"$work/packages.list"
+          mapfile -d '' -t packages <"$work/packages.list"
+          [[ ${#packages[@]} -gt 0 ]]
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+
+          darling_root=/usr/libexec/darling
+          linker="$darling_root/Library/Developer/DarlingCLT/usr/bin/ld"
+          [[ -x "$linker" ]]
+          ln -s "$linker" "$work/linker/ld"
+          sdk="$source_dir/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          [[ -f "$sdk/usr/include/stdlib.h" ]]
+
+          # Build only the project's small signing utility. The installed Darling package
+          # already supplies its native ld64; a second linker or cold stack build is unnecessary.
+          clang-18 -std=gnu11 -O0 \
+              -I"$source_dir/src/buildtools/include" \
+              -I"$source_dir/src/external/cctools-port/cctools/include" \
+              "$source_dir/src/buildtools/adhoc-sign.c" -lcrypto -o "$work/adhoc-sign"
+
+          # The source SDK + installed guest syslibroot match darling-guest-testing's
+          # guest-cc.sh. Only the production C source differs between these executables.
+          # https://github.com/darlinghq/darling-skills/blob/49e07ac6adfcbedc5a8d456489252178700fc7cc/darling-guest-testing/SKILL.md
+          for label in baseline reviewed final; do
+              file="$work/$label.c"
+              [[ $label != final ]] || file="$source_dir/src/tools/sudo.c"
+              clang-18 -target x86_64-apple-macos11.0 \
+                  -D__DARWIN_ONLY_UNIX_CONFORMANCE=1 -isysroot "$sdk" -B "$work/linker" \
+                  -Wl,-syslibroot,"$darling_root" -o "$work/bin/sudo-$label" "$file"
+              "$work/adhoc-sign" "$work/bin/sudo-$label"
+              /usr/bin/file "$work/bin/sudo-$label"
+              sha256sum "$file" "$work/bin/sudo-$label"
+          done
+
+          {
+              printf '## Real Darling guest qualification\n\n'
+              printf 'Source `%s`; upstream baseline `%s`; reviewed branch `%s`.\n\n' "$SOURCE_SHA" "$BASE_SHA" "$REVIEWED_SHA"
+              printf 'Runtime: upstream `%s`, DEB artifact `%s`.\n\n' bfd3cae463fd45a4cfd1b164d438e68b73e35ab6 15065757973
+              printf 'Production sources cross-compiled with the pinned source SDK and linked to the installed Darling runtime. No UID/GID or execution shims. This is not a full CMake stack build.\n\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # The launcher can require a second first-start attempt after a fresh shutdown.
+          if ! timeout -s KILL 120 darling shell /bin/sh -c 'printf guest-ready' </dev/null >"$work/logs/start.log" 2>&1; then
+              cat "$work/logs/start.log"
+              timeout -s KILL 120 darling shell /bin/sh -c 'printf guest-ready' </dev/null >"$work/logs/start.log" 2>&1
+          fi
+          cat "$work/logs/start.log"
+
+          for label in baseline reviewed final; do
+              set +e
+              timeout -s KILL 180 darling shell /bin/sh -c '
+                  TMPDIR="$4" SUDO_TEST_KEEP=1 /bin/sh "$1" "$2"
+                  result=$?
+                  printf "%s\n" "$result" >"$3"
+                  exit "$result"
+              ' sh \
+                  "/Volumes/SystemRoot$source_dir/tests/sudo-cli.sh" \
+                  "/Volumes/SystemRoot$work/bin/sudo-$label" \
+                  "/Volumes/SystemRoot$work/$label.status" \
+                  "/Volumes/SystemRoot$work/tmp" \
+                  </dev/null >"$work/logs/$label.log" 2>&1
+              launcher_status=$?
+              set -e
+              cat "$work/logs/$label.log"
+              [[ $launcher_status -lt 124 && -f "$work/$label.status" ]]
+              python3 "$harness/qualification.py" report "$label" "$work/logs/$label.log" "$(cat "$work/$label.status")"
+          done
+
+          timeout -s KILL 120 darling shell "/Volumes/SystemRoot$work/bin/sudo-final" \
+              -u 123 -g 456 DARLING_SUDO_TEST=guest-identity /bin/sh -c \
+              '/usr/bin/id -u; /usr/bin/id -g; printf "%s\n" "$DARLING_SUDO_TEST"' \
+              </dev/null >"$work/logs/identity.log" 2>"$work/logs/identity.err"
+          cat "$work/logs/identity.log" "$work/logs/identity.err"
+          [[ ! -s "$work/logs/identity.err" ]]
+          printf '123\n456\nguest-identity\n' >"$work/identity.expected"
+          cmp "$work/identity.expected" "$work/logs/identity.log"
+          printf 'Guest identity and environment check passed: UID 123, GID 456, assigned value preserved.\n' >>"$GITHUB_STEP_SUMMARY"
+          __DARLING_QUALIFICATION_SCRIPT__
+          bash "$harness/run-linux.sh" "$GITHUB_WORKSPACE/source"
+
+  native:
+    if: github.repository == 'burdettadam/darling'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
     steps:
-    - name: Checkout Darling
-      uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Qualify native execvP and same-user sudo PATH behavior
+        run: |
+          harness="$RUNNER_TEMP/sudo-1388-harness"
+          mkdir -p "$harness"
+          printf '%s\n' "$QUALIFICATION_HELPER" >"$harness/qualification.py"
+          cat >"$harness/run-macos.sh" <<'__DARLING_QUALIFICATION_SCRIPT__'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ulimit -c 0
 
-    # actions/checkout fetches submodules one at a time, which is slow with the
-    # number of submodules this repo has. Fetch them ourselves in parallel.
-    - name: Checkout submodules
-      run: git submodule update --init --recursive --depth 1 --jobs 8
+          source_dir=$(cd "$1" && pwd)
+          harness=$(cd "$(dirname "$0")" && pwd)
+          [[ ${SOURCE_SHA:?} =~ ^[0-9a-f]{40}$ ]]
+          [[ $(git -C "$source_dir" rev-parse HEAD) == "$SOURCE_SHA" ]]
+          work=$(mktemp -d "$RUNNER_TEMP/sudo-1388-native.XXXXXX")
+          mkdir -p "$work/bin" "$work/logs" "$work/tmp" "$work/original" "$work/assigned"
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update && sudo apt-get install devscripts equivs debhelper ccache
-        sudo mk-build-deps -i -r -t "apt-get --no-install-recommends -y" debian/control
+          git -C "$source_dir" fetch --no-tags --depth=1 origin "$BASE_SHA" "$REVIEWED_SHA"
+          git -C "$source_dir" show "$BASE_SHA:src/tools/sudo.c" >"$work/baseline.c"
+          git -C "$source_dir" show "$REVIEWED_SHA:src/tools/sudo.c" >"$work/reviewed.c"
+          cat >"$work/identity-shim.c" <<'EOF'
+          #include <sys/types.h>
+          int host_test_setuid(uid_t uid) { (void)uid; return 0; }
+          int host_test_setgid(gid_t gid) { (void)gid; return 0; }
+          EOF
 
-    # see https://github.com/actions/virtual-environments/issues/2606#issuecomment-772683150
-    - name: Free up space
-      run: |
-        sudo rm -rf /usr/share/dotnet
+          for label in baseline reviewed final; do
+              file="$work/$label.c"
+              [[ $label != final ]] || file="$source_dir/src/tools/sudo.c"
+              /usr/bin/clang -arch x86_64 -mmacosx-version-min=11.0 \
+                  -Dsetuid=host_test_setuid -Dsetgid=host_test_setgid \
+                  "$file" "$work/identity-shim.c" -o "$work/bin/sudo-$label"
+              /usr/bin/file "$work/bin/sudo-$label"
+              shasum -a 256 "$file" "$work/bin/sudo-$label"
+          done
 
-    # debuild runs the build with a scrubbed environment, so configure ccache
-    # system-wide rather than relying on CCACHE_* reaching the compiler.
-    # The mtime sloppiness settings matter in CI: a fresh checkout gives every
-    # file a current timestamp, which would otherwise make ccache refuse to
-    # cache the results. max_size has to hold a whole build's objects: when the
-    # cache is smaller, ccache evicts entries while it writes new ones, and the
-    # later part of every build misses.
-    - name: Configure ccache
-      run: |
-        sudo tee /etc/ccache.conf > /dev/null <<EOF
-        cache_dir = ${HOME}/.ccache
-        max_size = 5G
-        compiler_check = content
-        sloppiness = time_macros,include_file_mtime,include_file_ctime
-        EOF
+          {
+              printf '## Native macOS qualification\n\n'
+              /usr/bin/sw_vers
+              printf '\nSource `%s`; upstream baseline `%s`; reviewed branch `%s`.\n\n' "$SOURCE_SHA" "$BASE_SHA" "$REVIEWED_SHA"
+              printf 'Real native execvP/setenv; only setuid/setgid are replaced with no-op test functions.\n\n'
+          } >>"$GITHUB_STEP_SUMMARY"
 
-    - name: Restore ccache
-      uses: actions/cache/restore@v4
-      with:
-        path: ~/.ccache
-        key: ccache-deb-amd64-${{ github.ref_name }}-${{ github.run_id }}
-        restore-keys: |
-          ccache-deb-amd64-${{ github.event.repository.default_branch }}-
+          for label in baseline reviewed final; do
+              set +e
+              TMPDIR="$work/tmp" python3 "$harness/qualification.py" run "$work/logs/$label.log" 120 \
+                  /bin/sh "$source_dir/tests/sudo-cli.sh" "$work/bin/sudo-$label"
+              status=$?
+              set -e
+              cat "$work/logs/$label.log"
+              python3 "$harness/qualification.py" report "$label" "$work/logs/$label.log" "$status"
+          done
 
-    - name: Build DEBs
-      run: |
-        ccache --zero-stats
-        ./tools/debian/make-deb
+          # Black-box public-CLI oracle. The actual system sudo runs as the current
+          # numeric user, never as root; -n forbids password prompts. No sudoers edits.
+          runner_uid=$(/usr/bin/id -u)
+          [[ $runner_uid != 0 ]]
+          export LC_ALL=C
+          native_sudo=(/usr/bin/sudo -n -u "#$runner_uid")
+          /usr/bin/sudo -V >"$work/logs/sudo-version.log"
+          cat "$work/logs/sudo-version.log"
+          "${native_sudo[@]}" -- /usr/bin/true
+          "${native_sudo[@]}" "PATH=$work/assigned" /usr/bin/printenv PATH >"$work/logs/child-path.log"
+          printf '%s\n' "$work/assigned" >"$work/child-path.expected"
+          cmp "$work/child-path.expected" "$work/logs/child-path.log"
+          cat >"$work/assigned/true" <<'EOF'
+          #!/bin/sh
+          printf '%s\n' 'assigned-path-executable'
+          exit 77
+          EOF
+          chmod +x "$work/assigned/true"
+          set +e
+          python3 "$harness/qualification.py" run "$work/logs/oracle.log" 30 \
+              /usr/bin/env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+              "${native_sudo[@]}" "PATH=$work/assigned" true
+          oracle_status=$?
+          set -e
+          cat "$work/logs/oracle.log"
+          if [[ $oracle_status != 0 || -s "$work/logs/oracle.log" ]]; then
+              printf 'Stock sudo oracle did not confirm the expected behavior (exit %s); inspect its policy/error output above. No policy changes were attempted.\n' "$oracle_status" >>"$GITHUB_STEP_SUMMARY"
+              exit 1
+          fi
+          "${native_sudo[@]}" DARLING_SUDO_ORACLE_1388=value -- \
+              /usr/bin/printenv DARLING_SUDO_ORACLE_1388 >"$work/logs/separator-positive.log"
+          printf 'value\n' >"$work/separator-positive.expected"
+          cmp "$work/separator-positive.expected" "$work/logs/separator-positive.log"
+          missing_command="DARLING_SUDO_ORACLE_1388_${RANDOM}_${RANDOM}=value"
+          set +e
+          "${native_sudo[@]}" -- "$missing_command" /usr/bin/true \
+              >"$work/logs/separator-negative.out" 2>"$work/logs/separator-negative.err"
+          separator_status=$?
+          set -e
+          [[ $separator_status == 1 && ! -s "$work/logs/separator-negative.out" ]]
+          grep -F -- "$missing_command" "$work/logs/separator-negative.err"
+          printf 'Stock sudo oracle passed under the same host UID %s: command-line PATH reached the child without selecting the executable; -- stopped assignment parsing. The native policy may use secure_path.\n' "$runner_uid" >>"$GITHUB_STEP_SUMMARY"
+          __DARLING_QUALIFICATION_SCRIPT__
+          bash "$harness/run-macos.sh" "$GITHUB_WORKSPACE/source"
 
-    - name: ccache statistics
-      if: always()
-      run: ccache --show-stats --verbose
-
-    # Only pushes to the default branch save a cache; every other run restores
-    # the default branch's. The repository's cache storage is limited, and a
-    # cache per branch and pull request would evict the one all builds share.
-    # Saved even when the build fails, so that a long build that dies near the
-    # end still leaves its object files behind for the next run.
-    - name: Save ccache
-      if: always() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      uses: actions/cache/save@v4
-      with:
-        path: ~/.ccache
-        key: ccache-deb-amd64-${{ github.ref_name }}-${{ github.run_id }}
-
-    - name: Move DEBs
-      run: |
-        mkdir dist && mv ../*.deb dist
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4.1.0
-      with:
-        name: debs
-        path: dist/
-
-    # dpkg refuses to install a package over another one's files
-    - name: Check that no two DEBs ship the same file unless they conflict
-      run: python3 tests/deb-file-overlaps.py dist/*.deb
-
-  build-dsc:
-    needs: approval
-    if: ${{ !cancelled() && (needs.approval.result == 'success' || needs.approval.result == 'skipped') }}
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Darling
-      uses: actions/checkout@v4
-
-    # actions/checkout fetches submodules one at a time, which is slow with the
-    # number of submodules this repo has. Fetch them ourselves in parallel.
-    - name: Checkout submodules
-      run: git submodule update --init --recursive --depth 1 --jobs 8
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update && sudo apt-get install devscripts equivs debhelper
-
-    - name: Build DSCs
-      run: |
-        ./tools/debian/make-deb --dsc
-
-    - name: Move DSCs
-      run: |
-        mkdir source && mv ../*~$(lsb_release -cs)[-._]* source
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4.1.0
-      with:
-        name: 'deb-source'
-        path: source/
-
-  create-source-artifact:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Darling
-      uses: actions/checkout@v4
-      with:
-        path: source/darling
-
-    - name: Checkout submodules
-      working-directory: source/darling
-      run: git submodule update --init --recursive --depth 1 --jobs 8
-
-    - name: Compress source
-      run: |
-        mkdir -v archive
-        tar --create --use-compress-program="xz -9e" --verbose \
-            --file archive/darling-source.tar.xz \
-            --exclude=.git --exclude=.gitmodules --exclude=.gitignore \
-            --directory=source \
-            darling
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4.1.0
-      with:
-        name: 'source'
-        path: archive/
