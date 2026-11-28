@@ -14,7 +14,7 @@ on:
       components:
         description: Normal Darling component profile to build and install
         type: choice
-        default: cli
+        default: stock
         options: [cli, stock]
 
 permissions:
@@ -387,12 +387,12 @@ jobs:
           bash "$harness/run-macos.sh" "$GITHUB_WORKSPACE/source"
 
   installed:
-    name: installed-${{ inputs.components || 'cli' }}
+    name: installed-${{ inputs.components || 'stock' }}
     if: github.repository == 'burdettadam/darling'
     runs-on: ubuntu-26.04
     timeout-minutes: 240
     env:
-      BUILD_COMPONENTS: ${{ inputs.components || 'cli' }}
+      BUILD_COMPONENTS: ${{ inputs.components || 'stock' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -427,19 +427,22 @@ jobs:
           }
           trap cleanup EXIT
 
-          # cli is the complete upstream profile that owns sudo. The stock
-          # baseline currently fails in QuartzCore against its pinned Indium;
-          # retain stock as an explicit option without changing those sources.
+          # Use supported configuration options, with the baseline limitations
+          # recorded explicitly. No dependency pins or product sources are patched.
           printf 'Normal component profile: `%s`.\n\n' "$BUILD_COMPONENTS" >>"$GITHUB_STEP_SUMMARY"
-          swift_cmake=()
+          profile_cmake=()
           if [[ $BUILD_COMPONENTS == cli ]]; then
-              printf 'This qualifies the CLI configuration. The separate [stock baseline attempt](https://github.com/burdettadam/darling/actions/runs/46110462469/job/140872613272) failed to build QuartzCore against the pinned Indium before installation.\n\n' >>"$GITHUB_STEP_SUMMARY"
               # Automatic overlay compilation currently links CoreGraphics even
               # though that framework is outside the CLI profile. OFF is the
               # supported optional-overlay setting; prebuilt runtime installation
               # and the independent swift_toolchain CTest remain enabled.
-              swift_cmake=(-DSWIFT_TOOLCHAIN=OFF)
+              profile_cmake=(-DSWIFT_TOOLCHAIN=OFF)
               printf 'Optional Swift SDK overlay compilation is disabled with `SWIFT_TOOLCHAIN=OFF`; the bundled runtime installation remains enabled. The [CLI baseline with automatic overlays](https://github.com/burdettadam/darling/actions/runs/46114979799/job/140886653367) failed to link the excluded CoreGraphics framework. This run does not qualify those optional overlays.\n\n' >>"$GITHUB_STEP_SUMMARY"
+              printf 'The [CLI baseline without overlays](https://github.com/burdettadam/darling/actions/runs/46117326494/job/140893951707) also failed to link hdiutil against DiskArbitration, which is outside that profile.\n\n' >>"$GITHUB_STEP_SUMMARY"
+          else
+              profile_cmake=(-DENABLE_METAL=OFF)
+              printf 'Stock profile with the supported `ENABLE_METAL=OFF` configuration; Swift toolchain detection remains automatic. The [unmodified stock baseline](https://github.com/burdettadam/darling/actions/runs/46110462469/job/140872613272) failed to build QuartzCore against the pinned Indium. This run does not qualify Metal.\n\n' >>"$GITHUB_STEP_SUMMARY"
+              printf 'Stock includes CoreGraphics and DiskArbitration, whose absence blocked the separate CLI baseline attempts linked in the workflow history.\n\n' >>"$GITHUB_STEP_SUMMARY"
           fi
 
           # Keep compiler warnings out of the live log, while preserving the
@@ -492,10 +495,6 @@ jobs:
               exit 1
           fi
 
-          # No source or build-system changes other than the sudo fix enter
-          # this comparison. Keep the final regression script outside the tree.
-          git -C "$source_dir" checkout --detach "$BASE_SHA"
-
           stop_guest() {
               DPREFIX="$active_prefix" timeout -s KILL 60 "$launcher" shutdown \
                   </dev/null >"$work/logs/shutdown-$1.log" 2>&1
@@ -523,18 +522,36 @@ jobs:
               active_prefix=
           }
 
-          for label in baseline final; do
-              if [[ $label == final ]]; then
-                  git -C "$source_dir" checkout --detach "$SOURCE_SHA"
-              fi
-              printf '::group::%s normal %s build and installation\n' "$label" "$BUILD_COMPONENTS"
+          configure_build() {
               env CFLAGS= CXXFLAGS= CPPFLAGS= LDFLAGS= OBJCFLAGS= OBJCXXFLAGS= \
                   cmake -S "$source_dir" -B "$build" -G 'Unix Makefiles' \
                   -DCMAKE_INSTALL_PREFIX="$prefix" -DCOMPONENTS="$BUILD_COMPONENTS" \
                   -DDARLING_ARCHS=x86_64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-                  "${swift_cmake[@]}" \
+                  "${profile_cmake[@]}" \
                   -DDARLING_SWIFT_WMO=ON -DDARLING_NO_CCACHE=ON \
                   -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++
+          }
+
+          # Qualify the exact source target first, so an unrelated baseline
+          # component failure cannot hide the normal build result for our fix.
+          printf '::group::source sudo target through normal CMake\n'
+          [[ $(git -C "$source_dir" rev-parse HEAD) == "$SOURCE_SHA" ]]
+          configure_build
+          run_logged source-sudo cmake --build "$build" --target sudo --parallel 4
+          sha256sum "$source_dir/src/tools/sudo.c" "$build/src/tools/sudo"
+          printf 'Normal CMake sudo target built for source `%s`.\n\n' "$SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
+          printf '::endgroup::\n'
+
+          # No source or build-system changes other than the sudo fix enter
+          # this comparison. The final regression script is outside the tree.
+          for label in baseline final; do
+              if [[ $label == baseline ]]; then
+                  git -C "$source_dir" checkout --detach "$BASE_SHA"
+              else
+                  git -C "$source_dir" checkout --detach "$SOURCE_SHA"
+              fi
+              printf '::group::%s normal %s build and installation\n' "$label" "$BUILD_COMPONENTS"
+              configure_build
               run_logged "$label-sudo" cmake --build "$build" --target sudo --parallel 4
               run_logged "$label-build" cmake --build "$build" --parallel 4
               run_logged "$label-install" sudo cmake --install "$build"
