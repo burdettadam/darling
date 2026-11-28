@@ -431,8 +431,15 @@ jobs:
           # baseline currently fails in QuartzCore against its pinned Indium;
           # retain stock as an explicit option without changing those sources.
           printf 'Normal component profile: `%s`.\n\n' "$BUILD_COMPONENTS" >>"$GITHUB_STEP_SUMMARY"
+          swift_cmake=()
           if [[ $BUILD_COMPONENTS == cli ]]; then
               printf 'This qualifies the CLI configuration. The separate [stock baseline attempt](https://github.com/burdettadam/darling/actions/runs/46110462469/job/140872613272) failed to build QuartzCore against the pinned Indium before installation.\n\n' >>"$GITHUB_STEP_SUMMARY"
+              # Automatic overlay compilation currently links CoreGraphics even
+              # though that framework is outside the CLI profile. OFF is the
+              # supported optional-overlay setting; prebuilt runtime installation
+              # and the independent swift_toolchain CTest remain enabled.
+              swift_cmake=(-DSWIFT_TOOLCHAIN=OFF)
+              printf 'Optional Swift SDK overlay compilation is disabled with `SWIFT_TOOLCHAIN=OFF`; the bundled runtime installation remains enabled. The [CLI baseline with automatic overlays](https://github.com/burdettadam/darling/actions/runs/46114979799/job/140886653367) failed to link the excluded CoreGraphics framework. This run does not qualify those optional overlays.\n\n' >>"$GITHUB_STEP_SUMMARY"
           fi
 
           # Keep compiler warnings out of the live log, while preserving the
@@ -525,6 +532,7 @@ jobs:
                   cmake -S "$source_dir" -B "$build" -G 'Unix Makefiles' \
                   -DCMAKE_INSTALL_PREFIX="$prefix" -DCOMPONENTS="$BUILD_COMPONENTS" \
                   -DDARLING_ARCHS=x86_64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  "${swift_cmake[@]}" \
                   -DDARLING_SWIFT_WMO=ON -DDARLING_NO_CCACHE=ON \
                   -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++
               run_logged "$label-sudo" cmake --build "$build" --target sudo --parallel 4
