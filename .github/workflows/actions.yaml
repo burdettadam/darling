@@ -17,7 +17,7 @@ permissions:
   actions: read
 
 env:
-  SOURCE_SHA: ${{ inputs.source_sha || '55d7af5f9597c647226ccf3f4ffa1631a694c049' }}
+  SOURCE_SHA: ${{ inputs.source_sha || '89f10290b7757d91cc2be23a1adbe38a35e8a02f' }}
   BASE_SHA: c97ed9e7d4aaacb307acfd109c9b6cad77dc0016
   REVIEWED_SHA: ef4769e5a168aec4a07bdd68bfa070b2430d302a
   GIT_LFS_SKIP_SMUDGE: '1'
