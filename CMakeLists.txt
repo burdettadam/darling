@@ -268,6 +268,8 @@ option(ADHOC_CODESIGN "Ad-hoc sign every Mach-O image Darling builds" ON)
 
 # Host-side unit tests, run with ctest from the build directory
 enable_testing()
+add_test(NAME swift_cpu_flags
+	COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/tests/cmake/swift-cpu-flags.cmake)
 
 # Tests of the install and packaging scripts; they need no Darling build
 find_package(Python3 QUIET COMPONENTS Interpreter)
