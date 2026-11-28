@@ -1,0 +1,239 @@
+name: Validate PR 2755 three build repairs
+
+on:
+  push:
+    branches: [ci/2755-build-blockers]
+    paths: [.github/workflows/validate-build-blockers-v2.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  combined-debs:
+    name: Swift overlay and full repaired DEBs
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: burdettadam/darling
+          ref: cea3a7cf5af22382250a49d276be5ac2e8733886
+          persist-credentials: false
+      - name: Apply the exact packaging and sudo repairs
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/darlinghq/darling.git 9ec6be149909bcb97b0bb4287f749979c68eff44
+          git fetch --no-tags --depth=1 https://github.com/darlinghq/darling.git 8389f6734cded8eb834d326668b1c6a3b6bd8929
+          git fetch --no-tags --depth=1 https://github.com/burdettadam/darling.git 74402ddd5bd9f731b719c5d596ef966363f53937
+          git diff 8389f6734cded8eb834d326668b1c6a3b6bd8929 74402ddd5bd9f731b719c5d596ef966363f53937 -- debian/rules tests/rpm-packaging.py > /tmp/packaging-2756.patch
+          git apply --index /tmp/packaging-2756.patch
+          git fetch --no-tags --depth=1 https://github.com/darlinghq/darling.git c97ed9e7d4aaacb307acfd109c9b6cad77dc0016
+          git fetch --no-tags --depth=1 https://github.com/burdettadam/darling.git 95bd9b12fb2f402fc3a3fc31872d35558a603169
+          git diff c97ed9e7d4aaacb307acfd109c9b6cad77dc0016 95bd9b12fb2f402fc3a3fc31872d35558a603169 -- src/tools/sudo.c tests/sudo-cli.sh > /tmp/sudo-2755.patch
+          git apply --index /tmp/sudo-2755.patch
+      - name: Checkout upstream submodules and the exact XNU repair
+        run: |
+          git remote set-url origin https://github.com/darlinghq/darling.git
+          git submodule update --init --recursive --depth 1 --jobs 8
+          git -C src/external/xnu fetch --no-tags --depth=1 https://github.com/burdettadam/darling-xnu.git c68d6d218796259b6cbde336f1a1bf0cc3c4b9b1
+          git -C src/external/xnu checkout --detach c68d6d218796259b6cbde336f1a1bf0cc3c4b9b1
+          mkdir validation-logs
+          git rev-parse HEAD > validation-logs/parent-sha.txt
+          git -C src/external/xnu rev-parse HEAD > validation-logs/xnu-sha.txt
+          cp /tmp/packaging-2756.patch /tmp/sudo-2755.patch validation-logs/
+          git diff --check HEAD
+          git diff --stat HEAD
+      - name: Install normal package-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts equivs debhelper rpm ccache
+          sudo mk-build-deps -i -r -t "apt-get --no-install-recommends -y" debian/control
+          cmake --version
+          swiftc --version
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet
+      - name: Configure ccache as in upstream CI
+        run: |
+          sudo tee /etc/ccache.conf > /dev/null <<EOF
+          cache_dir = ${HOME}/.ccache
+          max_size = 5G
+          compiler_check = content
+          sloppiness = time_macros,include_file_mtime,include_file_ctime
+          EOF
+      - name: Restore compilation cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-pr2755-repairs-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-pr2755-repairs-${{ runner.os }}-
+      - name: Configure the normal Mach-O package build
+        run: |
+          ccache --zero-stats
+          make -f debian/rules override_dh_auto_configure-indep 2>&1 | tee validation-logs/swift-configure.log
+      - name: Verify CPU regression and its CTest registration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tempfile
+
+          with tempfile.TemporaryDirectory(prefix='swift-cpu-baseline-') as tmp:
+              fixture = Path(tmp)
+              for name in ('cmake/darling_swift.cmake', 'cmake/InstallSymlink.cmake'):
+                  dest = fixture / name
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(subprocess.check_output(['git', 'show', '9ec6be149909bcb97b0bb4287f749979c68eff44:' + name]))
+              test = fixture / 'tests/cmake/swift-cpu-flags.cmake'
+              test.parent.mkdir(parents=True, exist_ok=True)
+              test.write_bytes(Path('tests/cmake/swift-cpu-flags.cmake').read_bytes())
+              result = subprocess.run(['cmake', '-P', str(test)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              Path('validation-logs/swift-cpu-baseline.log').write_text(result.stdout)
+              print(result.stdout)
+              assert result.returncode == 1 and 'ARM64 CPU leaked to the x86_64 slice' in result.stdout, 'baseline did not reproduce the expected CPU regression'
+          PY
+          ctest --test-dir debbuild -R '^swift_cpu_flags$' --no-tests=error --output-on-failure 2>&1 | tee validation-logs/swift-cpu-ctest.log
+      - name: Verify both real Swift command generators
+        run: |
+          cat > validation-logs/check-caller-flags.py <<'PY'
+          #!/usr/bin/env python3
+          """Check both real Swift CMake callers without compiling or linking Swift."""
+          import argparse
+          import os
+          from pathlib import Path
+          import shlex
+          import subprocess
+          import sys
+          import tempfile
+          
+          FIXTURE = r'''cmake_minimum_required(VERSION 3.13)
+          project(SwiftCpuCallers C)
+          list(APPEND CMAKE_MODULE_PATH "${REPO}/cmake")
+          set(DARLING_TOP_DIRECTORY "${REPO}")
+          set(SWIFT_TOOLCHAIN_FOUND TRUE)
+          set(BUILD_TARGET_64BIT TRUE)
+          set(TARGET_ARM64 TRUE)
+          set(TARGET_x86_64 TRUE)
+          set(DARLING_ARCHS_64BIT x86_64 arm64)
+          set(DARLING_SWIFT_WMO ON)
+          # Only generate commands; this executable is never invoked as a Swift compiler.
+          set(SWIFT_COMPILER "${CMAKE_COMMAND}")
+          set(SWIFT_TOOLCHAIN_USR "${CMAKE_BINARY_DIR}/toolchain/usr")
+          set(DARLING_SWIFT_STDLIB_MODULES "${CMAKE_BINARY_DIR}/stdlib")
+          set(DARLING_SWIFT_RUNTIME_DIR "${CMAKE_BINARY_DIR}/runtime")
+          file(MAKE_DIRECTORY "${SWIFT_TOOLCHAIN_USR}/lib/clang/fixture"
+              "${SWIFT_TOOLCHAIN_USR}/lib/swift/shims" "${SWIFT_TOOLCHAIN_USR}/lib/swift/apinotes"
+              "${DARLING_SWIFT_STDLIB_MODULES}" "${DARLING_SWIFT_RUNTIME_DIR}")
+          include(darling_swift)
+          file(WRITE "${CMAKE_BINARY_DIR}/probe.swift" "// Configure-only fixture.\n")
+          function(add_darling_library)
+              add_library(${ARGV})
+          endfunction()
+          add_custom_target(lipo)
+          add_darling_swift_object(ProbeObject SOURCES "${CMAKE_BINARY_DIR}/probe.swift")
+          add_darling_swift_library(ProbeLibrary SOURCES "${CMAKE_BINARY_DIR}/probe.swift"
+              OBJECTS ${ProbeObject_OBJECT})
+          '''
+          
+          parser = argparse.ArgumentParser(description=__doc__)
+          parser.add_argument('repo', type=Path)
+          parser.add_argument('cmake')
+          parser.add_argument('--cpu', default='generic')
+          args = parser.parse_args()
+          
+          with tempfile.TemporaryDirectory(prefix='caller-flags-', dir=Path(__file__).resolve().parent) as tmp:
+              root = Path(tmp)
+              (root / 'CMakeLists.txt').write_text(FIXTURE)
+              build = root / 'build'
+              configure = subprocess.run(
+                  [args.cmake, '-S', str(root), '-B', str(build), '-G', 'Unix Makefiles',
+                   f'-DREPO={args.repo.resolve()}', f'-DDARLING_ARM64_CPU={args.cpu}'],
+                  env=dict(os.environ, TMPDIR=str(root)),
+                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              if configure.returncode:
+                  print(configure.stdout, file=sys.stderr)
+                  sys.exit(configure.returncode)
+              generated = (build / 'CMakeFiles/swiftProbeLibrary.dir/build.make').read_text()
+              observed = {}
+              problems = []
+              for line in generated.splitlines():
+                  if not line.startswith('\t') or '-module-name ' not in line:
+                      continue
+                  words = shlex.split(line)
+                  module = words[words.index('-module-name') + 1]
+                  target = words[words.index('-target') + 1]
+                  arch = target.split('-', 1)[0]
+                  cpus = [words[i + 1] for i, word in enumerate(words) if word == '-target-cpu']
+                  key = (module, arch)
+                  if key in observed:
+                      problems.append(f'duplicate command: {key}')
+                  observed[key] = cpus
+                  expected = [args.cpu] if arch == 'arm64' else []
+                  print(f'{module} {arch}: target-cpu={cpus!r}; expected={expected!r}')
+                  if cpus != expected:
+                      problems.append(f'{module} {arch}: wrong CPU flags')
+              expected_commands = {(module, arch) for module in ('ProbeObject', 'ProbeLibrary')
+                                   for arch in ('x86_64', 'arm64')}
+              if set(observed) != expected_commands:
+                  problems.append(f'wrong command coverage: {sorted(observed)}')
+              if problems:
+                  print('\n'.join(problems), file=sys.stderr)
+                  sys.exit(1)
+              print('PASS: all four generated Swift commands use the correct per-slice CPU policy')
+          
+          PY
+          python3 validation-logs/check-caller-flags.py "$PWD" "$(command -v cmake)" 2>&1 | tee validation-logs/swift-caller-generic.log
+          python3 validation-logs/check-caller-flags.py "$PWD" "$(command -v cmake)" --cpu cortex-a76 2>&1 | tee validation-logs/swift-caller-custom.log
+      - name: Build swiftDarwin for both 64-bit slices
+        run: |
+          cmake --build debbuild --target swiftDarwin --parallel "$(nproc)" --verbose 2>&1 | tee validation-logs/swiftDarwin.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          library = Path('debbuild/src/external/swift/libswiftDarwin.dylib')
+          lipo = 'debbuild/src/external/cctools-port/cctools/misc/lipo'
+          result = subprocess.check_output([lipo, '-archs', str(library)], text=True).strip()
+          Path('validation-logs/swiftDarwin-archs.txt').write_text(result + '\n')
+          print('swiftDarwin slices:', result)
+          assert set(result.split()) == {'x86_64', 'arm64'}, 'missing or unexpected Swift Darwin slice'
+          shutil.copy2(library, 'validation-logs/libswiftDarwin.dylib')
+          PY
+      - name: Build and test all normal DEB architectures
+        run: ./tools/debian/make-deb 2>&1 | tee validation-logs/build.log
+      - name: Check package file overlaps
+        run: |
+          mkdir dist
+          mv ../*.deb dist/
+          python3 tests/deb-file-overlaps.py dist/*.deb
+      - name: Record ccache statistics
+        if: always()
+        run: ccache --show-stats --verbose
+      - name: Save compilation cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-pr2755-repairs-${{ runner.os }}-${{ github.run_id }}
+      - name: Upload build and CTest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-v2-build-logs
+          path: |
+            validation-logs/
+            debbuild/Testing/Temporary/LastTest.log
+            debbuild-native/Testing/Temporary/LastTest.log
+          retention-days: 7
+      - name: Upload qualified DEBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualified-v2-debs
+          path: dist/*.deb
+          retention-days: 7
+
