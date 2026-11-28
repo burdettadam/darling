@@ -12,6 +12,7 @@ if (SWIFT_TOOLCHAIN_FOUND AND BUILD_TARGET_64BIT)
 		SOURCES
 			src/FoundationModels.swift
 		MODULES
+			Foundation
 			ObjectiveC
 			Darwin
 		FLAGS
