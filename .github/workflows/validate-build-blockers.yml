@@ -1,0 +1,154 @@
+name: Validate PR 2755 build repairs
+
+on:
+  push:
+    branches: [ci/2755-build-blockers]
+    paths: [.github/workflows/validate-build-blockers.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  packaging:
+    name: Packaging tests (${{ matrix.phase }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - phase: baseline
+            ref: 8389f6734cded8eb834d326668b1c6a3b6bd8929
+          - phase: fixed
+            ref: 74402ddd5bd9f731b719c5d596ef966363f53937
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: burdettadam/darling
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - name: Install packaging test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debhelper rpm cmake build-essential file tar gzip xz-utils python3
+          for program in python3 cmake make cc dh_install dh_makeshlibs rpm rpmspec rpmbuild tar file; do
+            command -v "$program"
+          done
+          dpkg-query -W debhelper rpm cmake gcc make
+      - name: Run both existing packaging suites without skips
+        env:
+          PHASE: ${{ matrix.phase }}
+        run: |
+          mkdir validation-logs
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          phase = os.environ['PHASE']
+          known = {
+              'debian': {'test_python_common_payload_reaches_binary_package'},
+              'rpm': {
+                  'test_noarch_packages_are_the_debian_architecture_all_packages',
+                  'test_slices_and_cmake_switches_match_debian',
+              },
+          }
+          allowed_rpm = known['rpm'] | {'test_x86_64_build_produces_the_native_and_all_noarch_packages'}
+          problems = []
+          for name, count in (('debian', 5), ('rpm', 20)):
+              result = subprocess.run(['python3', f'tests/{name}-packaging.py'],
+                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              output = result.stdout
+              Path(f'validation-logs/{name}.log').write_text(output)
+              print(f'{phase}: {name}: exit {result.returncode}', flush=True)
+              print(output, flush=True)
+              if not re.search(rf'^Ran {count} tests? in ', output, re.M):
+                  problems.append(f'{name}: incomplete test count')
+              if re.search(r'^SKIP|skipped=|^ERROR:', output, re.M):
+                  problems.append(f'{name}: skipped test or test error')
+              failures = set(re.findall(r'^FAIL: (\w+)', output, re.M))
+              if phase == 'fixed':
+                  if result.returncode != 0 or failures:
+                      problems.append(f'{name}: fixed suite failed')
+              else:
+                  allowed = known[name] if name == 'debian' else allowed_rpm
+                  if result.returncode != 1 or not known[name] <= failures or not failures <= allowed:
+                      problems.append(f'{name}: baseline did not reproduce only the known regressions')
+          if problems:
+              print('\n'.join(problems), file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Upload packaging test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-${{ matrix.phase }}
+          path: validation-logs/
+          retention-days: 7
+
+  combined-debs:
+    name: Full DEBs with sudo and both build repairs
+    needs: packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: burdettadam/darling
+          ref: 74402ddd5bd9f731b719c5d596ef966363f53937
+          persist-credentials: false
+      - name: Apply the exact sudo PR changes
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/darlinghq/darling.git c97ed9e7d4aaacb307acfd109c9b6cad77dc0016
+          git fetch --no-tags --depth=1 https://github.com/burdettadam/darling.git 95bd9b12fb2f402fc3a3fc31872d35558a603169
+          git diff c97ed9e7d4aaacb307acfd109c9b6cad77dc0016 95bd9b12fb2f402fc3a3fc31872d35558a603169 -- src/tools/sudo.c tests/sudo-cli.sh > /tmp/sudo-2755.patch
+          git apply --index /tmp/sudo-2755.patch
+      - name: Checkout upstream submodules and the exact XNU repair
+        run: |
+          git remote set-url origin https://github.com/darlinghq/darling.git
+          git submodule update --init --recursive --depth 1 --jobs 8
+          git -C src/external/xnu fetch --no-tags --depth=1 https://github.com/burdettadam/darling-xnu.git c68d6d218796259b6cbde336f1a1bf0cc3c4b9b1
+          git -C src/external/xnu checkout --detach c68d6d218796259b6cbde336f1a1bf0cc3c4b9b1
+          mkdir validation-logs
+          git rev-parse HEAD > validation-logs/parent-sha.txt
+          git -C src/external/xnu rev-parse HEAD > validation-logs/xnu-sha.txt
+          git diff HEAD -- src/tools/sudo.c tests/sudo-cli.sh > validation-logs/sudo.patch
+          git diff --check HEAD
+          git diff --stat HEAD
+      - name: Install normal package-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts equivs debhelper rpm
+          sudo mk-build-deps -i -r -t "apt-get --no-install-recommends -y" debian/control
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet
+      - name: Build and test all normal DEB architectures
+        run: ./tools/debian/make-deb 2>&1 | tee validation-logs/build.log
+      - name: Check package file overlaps
+        run: |
+          mkdir dist
+          mv ../*.deb dist/
+          python3 tests/deb-file-overlaps.py dist/*.deb
+      - name: Upload build and CTest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-build-logs
+          path: |
+            validation-logs/
+            debbuild/Testing/Temporary/LastTest.log
+            debbuild-native/Testing/Temporary/LastTest.log
+          retention-days: 7
+      - name: Upload qualified DEBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualified-debs
+          path: dist/*.deb
+          retention-days: 7
